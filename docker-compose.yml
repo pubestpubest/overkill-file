@@ -1,0 +1,51 @@
+version: '3.8'
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - api1
+      - api2
+  api1:
+    build:
+      context: backend
+    env_file: .env
+    depends_on:
+      - db
+      - minio
+      - redis
+  api2:
+    build:
+      context: backend
+    env_file: .env
+    depends_on:
+      - db
+      - minio
+      - redis
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+  minio:
+    image: minio/minio
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+  redis:
+    image: redis:7-alpine
+volumes:
+  db_data:
+  minio_data:
