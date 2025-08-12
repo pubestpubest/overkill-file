@@ -81,7 +81,44 @@ A Docker-based deployment with official images where possible, plus a single cus
 - **Backend API** — Go (Gin), stateless, JWT, presign to MinIO, metadata in Postgres; optional Redis caching.
 - **Database** — `postgres:16-alpine` for users/files/shares/activities.
 - **Object Storage** — `minio/minio` (S3-compatible).
-- **Cache (optional)** — `redis:7-alpine` for hot metadata & rate-limit counters.
+- **Cache** — `redis:7-alpine` for share lookup caching and rate-limit counters.
 - **Admin (optional)** — `dpage/pgadmin4`, `redis-commander`.
 
 ---
+
+## Quick Start
+
+Copy the example environment and start the stack with Docker Compose:
+
+```
+cp .env.example .env
+docker compose up -d --build
+```
+
+Register and log in with sample commands:
+
+```
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"email":"demo@example.com","password":"demo"}' \
+  http://localhost:8080/api/register
+
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"email":"demo@example.com","password":"demo"}' \
+  http://localhost:8080/api/login
+```
+
+The frontend is available at [http://localhost:8080](http://localhost:8080).
+
+Nginx acts as a load balancer between two backend replicas, and Redis caches share lookups.
+
+### Frontend development
+
+The frontend uses [pnpm](https://pnpm.io) for dependency management. To work on it locally:
+
+```
+cd frontend
+pnpm install
+pnpm dev
+```
+
+Build production assets with `pnpm build`.
