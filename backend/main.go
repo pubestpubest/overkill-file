@@ -4,11 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"filebox/backend/migrations"
+	"filebox/backend/models"
+	"filebox/backend/validation"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -36,7 +41,12 @@ func main() {
 	if err = db.Ping(); err != nil {
 		log.Fatal(err)
 	}
-	initDB()
+	
+	// Run database migrations
+	migrator := migrations.NewMigrator(db)
+	if err := migrator.RunMigrations(); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
 
 	minioClient, err = minio.New(mustGetenv("MINIO_ENDPOINT"), &minio.Options{
 		Creds:  credentials.NewStaticV4(mustGetenv("MINIO_ACCESS_KEY"), mustGetenv("MINIO_SECRET_KEY"), ""),
@@ -78,27 +88,7 @@ func main() {
 	}
 }
 
-func initDB() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS files (
-        id SERIAL PRIMARY KEY,
-        user_id INT REFERENCES users(id),
-        name TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS shares (
-        id SERIAL PRIMARY KEY,
-        file_id INT REFERENCES files(id),
-        token TEXT UNIQUE NOT NULL,
-        expires TIMESTAMPTZ NOT NULL
-    );`)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
+// initDB function is no longer needed as migrations handle schema creation
 
 type credentialsInput struct {
 	Email    string `json:"email"`
@@ -111,12 +101,33 @@ func register(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid input"})
 		return
 	}
-	hash, _ := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
-	_, err := db.Exec("INSERT INTO users(email,password) VALUES($1,$2)", in.Email, string(hash))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "email exists"})
+	
+	// Validate email format
+	if err := validation.ValidateEmail(in.Email); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	
+	// Validate password strength
+	if err := validation.ValidatePassword(in.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	// Hash password with higher cost for better security
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), 12)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "password hashing failed"})
+		return
+	}
+	
+	// Insert user with created_at timestamp
+	_, err = db.Exec("INSERT INTO users(email, password, created_at) VALUES($1, $2, NOW())", in.Email, string(hash))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email already exists"})
+		return
+	}
+	
 	c.Status(http.StatusCreated)
 }
 
@@ -141,109 +152,229 @@ func login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": s})
 }
 
-type fileMeta struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+type fileRequest struct {
+	Name        string        `json:"name"`
+	Size        *int64        `json:"size,omitempty"`
+	ContentType *string       `json:"content_type,omitempty"`
+	Tags        models.Tags   `json:"tags,omitempty"`
 }
 
 func presign(c *gin.Context) {
-	var req struct {
-		Name string `json:"name"`
-	}
+	var req fileRequest
 	if err := c.BindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid input"})
 		return
 	}
+	
+	// Validate file name
+	if err := validation.ValidateFileName(req.Name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	
+	// Validate file size if provided
+	if req.Size != nil {
+		if err := validation.ValidateFileSize(*req.Size); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	
+	// Validate content type if provided
+	if req.ContentType != nil {
+		if err := validation.ValidateContentType(*req.ContentType); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	
+	// Generate pre-signed URL with 10-minute expiration
 	url, err := minioClient.PresignedPutObject(context.Background(), bucketName, req.Name, time.Minute*10)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "presign failed"})
 		return
 	}
+	
 	c.JSON(http.StatusOK, gin.H{"url": url.String()})
 }
 
 func createFile(c *gin.Context) {
 	userID := c.GetInt("userID")
-	var meta fileMeta
-	if err := c.BindJSON(&meta); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid"})
+	var req fileRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid input"})
 		return
 	}
-	err := db.QueryRow("INSERT INTO files(user_id,name) VALUES($1,$2) RETURNING id", userID, meta.Name).Scan(&meta.ID)
+	
+	// Create file model for validation
+	file := &models.File{
+		UserID:      userID,
+		Name:        req.Name,
+		Size:        req.Size,
+		ContentType: req.ContentType,
+		Tags:        req.Tags,
+	}
+	
+	// Validate file data
+	if errors := validation.ValidateFile(file); errors.HasErrors() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errors.Error()})
+		return
+	}
+	
+	// Insert file with comprehensive metadata
+	var fileID int
+	err := db.QueryRow(`
+		INSERT INTO files(user_id, name, size, content_type, tags, created_at, updated_at) 
+		VALUES($1, $2, $3, $4, $5, NOW(), NOW()) 
+		RETURNING id`, 
+		userID, req.Name, req.Size, req.ContentType, req.Tags).Scan(&fileID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "save failed"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save file metadata"})
 		return
 	}
-	c.JSON(http.StatusOK, meta)
+	
+	// Log activity
+	logActivity(&userID, "file_upload", "file", &fileID, map[string]interface{}{
+		"file_name": req.Name,
+		"file_size": req.Size,
+	})
+	
+	// Return created file metadata
+	file.ID = fileID
+	c.JSON(http.StatusOK, file)
 }
 
 func listFiles(c *gin.Context) {
 	userID := c.GetInt("userID")
-	rows, err := db.Query("SELECT id,name FROM files WHERE user_id=$1", userID)
+	
+	// Query with comprehensive file metadata
+	rows, err := db.Query(`
+		SELECT id, user_id, name, size, content_type, tags, created_at, updated_at 
+		FROM files 
+		WHERE user_id = $1 
+		ORDER BY created_at DESC`, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query failed"})
 		return
 	}
 	defer rows.Close()
-	var files []fileMeta
+	
+	var files []models.File
 	for rows.Next() {
-		var f fileMeta
-		if err := rows.Scan(&f.ID, &f.Name); err == nil {
+		var f models.File
+		err := rows.Scan(&f.ID, &f.UserID, &f.Name, &f.Size, &f.ContentType, &f.Tags, &f.CreatedAt, &f.UpdatedAt)
+		if err == nil {
 			files = append(files, f)
 		}
 	}
+	
+	// Return empty array instead of null if no files
+	if files == nil {
+		files = []models.File{}
+	}
+	
 	c.JSON(http.StatusOK, files)
 }
 
 func createShare(c *gin.Context) {
 	userID := c.GetInt("userID")
 	fileID := c.Param("id")
+	
+	// Verify file ownership and get file details
 	var owner int
 	var name string
-	err := db.QueryRow("SELECT user_id,name FROM files WHERE id=$1", fileID).Scan(&owner, &name)
+	err := db.QueryRow("SELECT user_id, name FROM files WHERE id = $1", fileID).Scan(&owner, &name)
 	if err != nil || owner != userID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
 		return
 	}
-	token := generateToken()
+	
+	// Generate cryptographically secure token
+	token := generateSecureToken()
 	expires := time.Now().Add(10 * time.Minute)
-	_, err = db.Exec("INSERT INTO shares(file_id,token,expires) VALUES($1,$2,$3)", fileID, token, expires)
+	
+	// Insert share record with proper timestamps
+	var shareID int
+	err = db.QueryRow(`
+		INSERT INTO shares(file_id, token, expires, created_at) 
+		VALUES($1, $2, $3, NOW()) 
+		RETURNING id`, fileID, token, expires).Scan(&shareID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "share failed"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create share"})
 		return
 	}
-	redisClient.Set(context.Background(), token, name, time.Until(expires))
-	c.JSON(http.StatusOK, gin.H{"token": token})
+	
+	// Cache share token in Redis with TTL
+	ctx := context.Background()
+	redisClient.Set(ctx, token, name, time.Until(expires))
+	
+	// Log activity
+	logActivity(&userID, "share_create", "share", &shareID, map[string]interface{}{
+		"file_id":   fileID,
+		"file_name": name,
+		"expires":   expires,
+	})
+	
+	c.JSON(http.StatusOK, gin.H{
+		"token":   token,
+		"expires": expires,
+	})
 }
 
 func downloadShare(c *gin.Context) {
 	token := c.Param("token")
 	ctx := context.Background()
+	
+	// Try to get file name from Redis cache first
 	name, err := redisClient.Get(ctx, token).Result()
 	if err == redis.Nil {
+		// Cache miss - query database
 		var fileID int
 		var expires time.Time
-		err = db.QueryRow("SELECT file_id,expires FROM shares WHERE token=$1", token).Scan(&fileID, &expires)
-		if err != nil || time.Now().After(expires) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "invalid"})
-			return
-		}
-		err = db.QueryRow("SELECT name FROM files WHERE id=$1", fileID).Scan(&name)
+		err = db.QueryRow("SELECT file_id, expires FROM shares WHERE token = $1", token).Scan(&fileID, &expires)
 		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "share token not found"})
 			return
 		}
+		
+		// Check if share has expired
+		if time.Now().After(expires) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "share token expired"})
+			return
+		}
+		
+		// Get file name
+		err = db.QueryRow("SELECT name FROM files WHERE id = $1", fileID).Scan(&name)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+			return
+		}
+		
+		// Cache the result with remaining TTL
 		redisClient.Set(ctx, token, name, time.Until(expires))
+		
+		// Log activity (anonymous access)
+		logActivity(nil, "share_access", "share", nil, map[string]interface{}{
+			"token":     token,
+			"file_id":   fileID,
+			"file_name": name,
+		})
 	} else if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "cache failed"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cache error"})
 		return
 	}
+	
+	// Generate pre-signed download URL
 	url, err := minioClient.PresignedGetObject(ctx, bucketName, name, time.Minute*10, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "presign failed"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate download URL"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"url": url.String()})
+	
+	c.JSON(http.StatusOK, gin.H{
+		"url":       url.String(),
+		"file_name": name,
+	})
 }
 
 func authMiddleware(c *gin.Context) {
@@ -267,12 +398,27 @@ func authMiddleware(c *gin.Context) {
 	c.Next()
 }
 
-func generateToken() string {
-	b := make([]byte, 16)
+func generateSecureToken() string {
+	b := make([]byte, 32) // Increased to 32 bytes for better security
 	if _, err := rand.Read(b); err != nil {
+		log.Printf("Failed to generate secure token: %v", err)
 		return ""
 	}
 	return fmt.Sprintf("%x", b)
+}
+
+// logActivity logs user activities for audit trail
+func logActivity(userID *int, action, resourceType string, resourceID *int, metadata map[string]interface{}) {
+	metadataJSON, _ := json.Marshal(metadata)
+	
+	_, err := db.Exec(`
+		INSERT INTO activities(user_id, action, resource_type, resource_id, metadata, created_at) 
+		VALUES($1, $2, $3, $4, $5, NOW())`,
+		userID, action, resourceType, resourceID, metadataJSON)
+	
+	if err != nil {
+		log.Printf("Failed to log activity: %v", err)
+	}
 }
 
 func mustGetenv(key string) string {
