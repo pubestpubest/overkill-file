@@ -7,24 +7,34 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
   api1:
     build:
       context: backend
     env_file: .env
     depends_on:
-      - db
-      - minio
-      - redis
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
   api2:
     build:
       context: backend
     env_file: .env
     depends_on:
-      - db
-      - minio
-      - redis
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
   db:
     image: postgres:16-alpine
     environment:
@@ -33,6 +43,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
   minio:
     image: minio/minio
     command: server /data --console-address :9001
@@ -44,8 +59,18 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
   redis:
     image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 volumes:
   db_data:
   minio_data:

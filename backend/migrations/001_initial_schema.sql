@@ -68,10 +68,4 @@ CREATE TRIGGER update_files_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
--- Insert initial migration record
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INT PRIMARY KEY,
-    applied_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
+-- Schema migrations table will be created by the migration system

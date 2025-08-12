@@ -31,15 +31,97 @@ var redisClient *redis.Client
 var jwtSecret []byte
 var bucketName string
 
+// connectToDatabase attempts to connect to the database with retry logic
+func connectToDatabase(databaseURL string) (*sql.DB, error) {
+	maxRetries := 30
+	retryInterval := 2 * time.Second
+	
+	for i := 0; i < maxRetries; i++ {
+		db, err := sql.Open("postgres", databaseURL)
+		if err != nil {
+			log.Printf("Failed to open database connection (attempt %d/%d): %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		
+		if err = db.Ping(); err != nil {
+			log.Printf("Failed to ping database (attempt %d/%d): %v", i+1, maxRetries, err)
+			db.Close()
+			time.Sleep(retryInterval)
+			continue
+		}
+		
+		log.Printf("Successfully connected to database on attempt %d", i+1)
+		return db, nil
+	}
+	
+	return nil, fmt.Errorf("failed to connect to database after %d attempts", maxRetries)
+}
+
+// connectToMinio attempts to connect to MinIO with retry logic
+func connectToMinio() (*minio.Client, error) {
+	maxRetries := 30
+	retryInterval := 2 * time.Second
+	
+	for i := 0; i < maxRetries; i++ {
+		client, err := minio.New(mustGetenv("MINIO_ENDPOINT"), &minio.Options{
+			Creds:  credentials.NewStaticV4(mustGetenv("MINIO_ACCESS_KEY"), mustGetenv("MINIO_SECRET_KEY"), ""),
+			Secure: false,
+		})
+		if err != nil {
+			log.Printf("Failed to create MinIO client (attempt %d/%d): %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		
+		// Test connection by listing buckets
+		_, err = client.ListBuckets(context.Background())
+		if err != nil {
+			log.Printf("Failed to connect to MinIO (attempt %d/%d): %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		
+		log.Printf("Successfully connected to MinIO on attempt %d", i+1)
+		return client, nil
+	}
+	
+	return nil, fmt.Errorf("failed to connect to MinIO after %d attempts", maxRetries)
+}
+
+// connectToRedis attempts to connect to Redis with retry logic
+func connectToRedis() (*redis.Client, error) {
+	maxRetries := 30
+	retryInterval := 2 * time.Second
+	
+	for i := 0; i < maxRetries; i++ {
+		client := redis.NewClient(&redis.Options{
+			Addr:     mustGetenv("REDIS_ADDR"),
+			Password: os.Getenv("REDIS_PASSWORD"),
+		})
+		
+		if err := client.Ping(context.Background()).Err(); err != nil {
+			log.Printf("Failed to connect to Redis (attempt %d/%d): %v", i+1, maxRetries, err)
+			client.Close()
+			time.Sleep(retryInterval)
+			continue
+		}
+		
+		log.Printf("Successfully connected to Redis on attempt %d", i+1)
+		return client, nil
+	}
+	
+	return nil, fmt.Errorf("failed to connect to Redis after %d attempts", maxRetries)
+}
+
 func main() {
 	var err error
 	godotenv.Load()
-	db, err = sql.Open("postgres", mustGetenv("DATABASE_URL"))
+	
+	// Connect to database with retry logic
+	db, err = connectToDatabase(mustGetenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatal(err)
-	}
-	if err = db.Ping(); err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to connect to database after retries: %v", err)
 	}
 	
 	// Run database migrations
@@ -48,28 +130,27 @@ func main() {
 		log.Fatalf("Failed to run migrations: %v", err)
 	}
 
-	minioClient, err = minio.New(mustGetenv("MINIO_ENDPOINT"), &minio.Options{
-		Creds:  credentials.NewStaticV4(mustGetenv("MINIO_ACCESS_KEY"), mustGetenv("MINIO_SECRET_KEY"), ""),
-		Secure: false,
-	})
+	// Connect to MinIO with retry logic
+	minioClient, err = connectToMinio()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to connect to MinIO after retries: %v", err)
 	}
+	
+	// Setup bucket
 	bucketName = mustGetenv("MINIO_BUCKET")
 	exists, err := minioClient.BucketExists(context.Background(), bucketName)
 	if err == nil && !exists {
 		if err = minioClient.MakeBucket(context.Background(), bucketName, minio.MakeBucketOptions{}); err != nil {
-			log.Fatal(err)
+			log.Fatalf("Failed to create MinIO bucket: %v", err)
 		}
 	}
+	
 	jwtSecret = []byte(mustGetenv("JWT_SECRET"))
 
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     mustGetenv("REDIS_ADDR"),
-		Password: os.Getenv("REDIS_PASSWORD"),
-	})
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
-		log.Fatal(err)
+	// Connect to Redis with retry logic
+	redisClient, err = connectToRedis()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis after retries: %v", err)
 	}
 
 	r := gin.Default()
